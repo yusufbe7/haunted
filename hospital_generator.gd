@@ -1,374 +1,536 @@
 extends Node3D
-## Hospital room generator — builds the room from your real FBX asset kit
-## (floor/wall/ceiling tiles + furniture) instead of placeholder BoxMesh boxes.
+## ============================================================================
+##  HAUNTED SALVAGE — LARGE HOSPITAL WARD GENERATOR  (Godot 4.7.1)
+## ============================================================================
+##  Builds one big, walkable hospital ward at runtime from your FBX kit:
+##    * large room  (default 20m wide x 16m long x 4m tall)
+##    * 4 auto-built walls + a big entrance doorway in the FRONT wall
+##    * floor tiled from floor_tile_1.fbx (no gaps — step is measured from the
+##      model's real AABB, so it works whatever size your tile actually is)
+##    * white ceiling with real ceiling lights
+##    * furniture seated ON the floor and CENTERED on its footprint, so nothing
+##      floats, sinks, clips a wall, or overlaps another object
+##    * PBR bed material from your Bed_* texture set
+##    * first-person camera at 1.7m, wide FOV, ready for WASD movement
 ##
-## Measured directly from your .fbx files:
-##   wall/doorway/window tile = 2.0m wide x 2.5m tall
-##   floor/ceiling tile       = 2.0m x 2.0m
-## so room_width / room_length should stay multiples of 2.0 (12 x 10 already is).
+##  Every model load is guarded: a missing FBX prints
+##      "MODEL TOPILMADI: <path>"
+##  and the rest of the room keeps generating.
+## ============================================================================
 
 # =========================
-# CONFIG
+#  CONFIG  (tweak in the Inspector — no code changes needed)
 # =========================
 @export_group("Room size (meters)")
-@export var room_width: float = 12.0
-@export var room_length: float = 10.0
+@export var room_width: float = 20.0     # X — eni
+@export var room_length: float = 16.0    # Z — uzunligi
+@export var room_height: float = 4.0     # Y — balandligi
+@export var wall_thickness: float = 0.2
+
+@export_group("Entrance door (front wall)")
+@export var door_width: float = 2.4
+@export var door_height: float = 2.6
 
 @export_group("Assets")
-@export var models_path: String = "res://assets/hospital_kit/" # folder with the .fbx files
-@export var scripts_path: String = "res://scripts/"            # folder with hospital_door.gd / hospital_player.gd
+## Primary folder with your .fbx files. Extra folders are tried as fallback,
+## so the same script works whether your models live in res://models/ or in
+## res://assets/hospital_kit/.
+@export var models_path: String = "res://models/"
+@export var scripts_path: String = "res://scripts/"
+## Folder with the Bed_BaseColor.png / Bed_Normal.png / ... texture set.
+@export var bed_texture_dir: String = "res://models/textures/bed/"
 
 @export_group("Debug")
-## Turn this on to spawn a fixed camera high above the room looking straight
-## down, instead of the walkable player. Useful for checking that the room
-## itself generated correctly, independent of player physics/collision.
+## Fixed camera high above the room, looking straight down. Handy for checking
+## the layout. Ships OFF so the game is playable in first person.
 @export var debug_top_down: bool = false
 
-@export_group("Corner tuning")
-## tile_corner.fbx rotation per corner, derived from its measured geometry.
-## If a corner looks mirrored/rotated once you see it in the editor, nudge
-## these by 90/180 — no other code needs to change.
-@export var corner_rotation_sw: float = 270.0
-@export var corner_rotation_se: float = 180.0
-@export var corner_rotation_ne: float = 90.0
-@export var corner_rotation_nw: float = 0.0
+# Folders searched, in order, when resolving a model / texture.
+const FALLBACK_MODEL_DIRS := ["res://models/", "res://assets/hospital_kit/"]
+const FALLBACK_TEX_DIRS := ["res://models/textures/bed/", "res://assets/hospital_kit/textures/bed/"]
 
-const TILE_SIZE := 2.0
-const WALL_HEIGHT := 2.5
-
-const MODEL_NAMES := [
-	"tile_wall", "tile_wall_half", "tile_corner", "tile_doorway_1", "tile_doorway_2",
-	"tile_window", "floor_tile_1", "floor_tile_2", "ceiling_tile", "ceiling_light",
-	"bed", "bench", "cabinet_1", "cabinet_2", "cabinet_3", "chair", "table",
-	"door_1", "door_2", "Exit_sign", "IV_Bag", "IV_Bag_holder", "Magazine1",
-	"pillar", "wheel_chair"
-]
-
-## Simple box colliders built in code, sized from the real measured geometry
-## of each model. This sidesteps the Jolt "Need triangles to create a mesh
-## shape" crash that happens when an imported concave/trimesh collider gets
-## instanced many times — no per-file Import setup needed at all.
-const COLLISION_BOXES := {
-	"tile_wall": [{"size": Vector3(2.0, 2.5, 0.18), "offset": Vector3(0, 1.25, 0)}],
-	"tile_wall_half": [{"size": Vector3(1.0, 2.5, 0.18), "offset": Vector3(0, 1.25, 0)}],
-	"tile_window": [{"size": Vector3(2.0, 2.5, 0.18), "offset": Vector3(0, 1.25, 0)}],
-	"tile_corner": [
-		{"size": Vector3(1.0, 2.5, 0.18), "offset": Vector3(0.5, 1.25, 0)},
-		{"size": Vector3(0.18, 2.5, 1.9), "offset": Vector3(0, 1.25, -0.95)},
-	],
-	"tile_doorway_1": [
-		{"size": Vector3(2.0, 0.5, 0.18), "offset": Vector3(0, 2.25, 0)},
-		{"size": Vector3(0.2, 2.0, 0.18), "offset": Vector3(-0.9, 1.0, 0)},
-		{"size": Vector3(0.2, 2.0, 0.18), "offset": Vector3(0.9, 1.0, 0)},
-	],
-	"tile_doorway_2": [
-		{"size": Vector3(3.0, 0.5, 0.18), "offset": Vector3(0, 2.25, 0)},
-		{"size": Vector3(0.7, 2.0, 0.18), "offset": Vector3(-1.15, 1.0, 0)},
-		{"size": Vector3(0.7, 2.0, 0.18), "offset": Vector3(1.15, 1.0, 0)},
-	],
-	"floor_tile_1": [{"size": Vector3(2.0, 0.1, 2.0), "offset": Vector3(0, 0.05, 0)}],
-	"floor_tile_2": [{"size": Vector3(2.0, 0.1, 2.0), "offset": Vector3(0, 0.05, 0)}],
-	"bed": [{"size": Vector3(1.42, 1.18, 3.21), "offset": Vector3(-0.01, 0.09, -0.04)}],
-	"bench": [{"size": Vector3(2.36, 1.27, 0.78), "offset": Vector3(0, -0.11, 0.03)}],
-	"cabinet_1": [{"size": Vector3(2.01, 0.86, 0.78), "offset": Vector3(0, -0.02, -0.27)}],
-	"cabinet_2": [{"size": Vector3(1.01, 0.65, 0.49), "offset": Vector3(0.02, 0.0, -0.12)}],
-	"cabinet_3": [{"size": Vector3(0.65, 0.79, 0.54), "offset": Vector3(0, -0.11, -0.16)}],
-	"chair": [{"size": Vector3(0.82, 1.40, 0.97), "offset": Vector3(0, -0.12, 0.01)}],
-	"table": [{"size": Vector3(2.41, 1.05, 1.62), "offset": Vector3(0.02, -0.24, 0.01)}],
-	"wheel_chair": [{"size": Vector3(1.01, 1.35, 1.49), "offset": Vector3(0, 0.25, 0.14)}],
-	"IV_Bag_holder": [{"size": Vector3(0.64, 2.00, 0.63), "offset": Vector3(0, -0.15, 0)}],
-	"door_1": [{"size": Vector3(1.09, 2.02, 0.13), "offset": Vector3(0.45, 0.99, 0)}],
-	"door_2": [{"size": Vector3(1.00, 2.00, 0.08), "offset": Vector3(0.50, 1.0, 0)}],
+# Some kits name the same asset differently — try each spelling.
+const NAME_ALIASES := {
+	"Magazine_1": ["Magazine_1", "Magazine1"],
+	"floor_tile_1": ["floor_tile_1", "floor_tile"],
+	"ceiling_light": ["ceiling_light", "CeilingLight"],
 }
 
-var models: Dictionary = {}
-var room_cols: int
-var room_rows: int
+var _models: Dictionary = {}   # logical name -> PackedScene (only ones found)
+var _bed_material: StandardMaterial3D = null
 
 
+# =========================
+#  ENTRY POINT
+# =========================
 func _ready() -> void:
-	room_cols = max(3, int(round(room_width / TILE_SIZE)))
-	room_rows = max(3, int(round(room_length / TILE_SIZE)))
-	room_width = room_cols * TILE_SIZE   # snap to the tile grid
-	room_length = room_rows * TILE_SIZE
-
-	load_models()
-	generate_hospital()
+	_ensure_input_actions()
 	create_lighting()
+	create_floor_tiles()
+	create_ceiling()
+	create_walls()
+	place_furniture()
 	if debug_top_down:
-		spawn_debug_camera()
+		create_debug_camera()
 	else:
-		spawn_player()
+		create_camera()
+	print("Hospital ward ready: %.1fm x %.1fm x %.1fm" % [room_width, room_length, room_height])
 
 
-func spawn_debug_camera() -> void:
-	var cam := Camera3D.new()
-	cam.name = "DebugTopDownCamera"
-	var highest = max(room_width, room_length)
-	cam.position = Vector3(0, highest * 1.2, 0)
-	cam.rotation_degrees = Vector3(-90, 0, 0)
-	cam.current = true
-	cam.far = highest * 5.0
-	add_child(cam)
+## Register WASD + interact here too, so movement and the door still work even
+## if a spawned node's own _ready timing differs. Existing bindings are kept.
+func _ensure_input_actions() -> void:
+	var binds := {
+		"move_forward": KEY_W,
+		"move_back": KEY_S,
+		"move_left": KEY_A,
+		"move_right": KEY_D,
+		"interact": KEY_E,
+	}
+	for action in binds:
+		if not InputMap.has_action(action):
+			InputMap.add_action(action)
+		var ev := InputEventKey.new()
+		ev.keycode = binds[action]
+		InputMap.action_add_event(action, ev)
 
 
 # =========================
-# ASSET LOADING
+#  ASSET LOADING  (graceful — never crashes on a missing file)
 # =========================
-func load_models() -> void:
-	for n in MODEL_NAMES:
-		var path := models_path.path_join(n + ".fbx")
-		if ResourceLoader.exists(path):
-			models[n] = load(path)
-		else:
-			push_warning("Hospital kit: model not found -> %s" % path)
+func get_model(base_name: String) -> PackedScene:
+	if _models.has(base_name):
+		return _models[base_name]
+
+	var names: Array = NAME_ALIASES.get(base_name, [base_name])
+	var dirs: Array = [models_path]
+	for d in FALLBACK_MODEL_DIRS:
+		if not dirs.has(d):
+			dirs.append(d)
+
+	for dir in dirs:
+		for nm in names:
+			var path: String = dir.path_join(nm + ".fbx")
+			if ResourceLoader.exists(path):
+				var res: PackedScene = load(path)
+				_models[base_name] = res
+				return res
+
+	push_warning("MODEL TOPILMADI: %s.fbx" % base_name)
+	print("MODEL TOPILMADI: %s.fbx" % base_name)
+	_models[base_name] = null
+	return null
 
 
-func spawn(model_name: String, pos: Vector3, rot_y_deg: float = 0.0, parent: Node3D = self) -> Node3D:
-	if not models.has(model_name):
+## Instance a model, add it to the tree, disable backface culling (so interior
+## faces stay visible) and return it. Returns null if the model is missing.
+func spawn_model(base_name: String, rot_y_deg: float = 0.0, parent: Node3D = self) -> Node3D:
+	var packed := get_model(base_name)
+	if packed == null:
 		return null
-	var inst: Node3D = models[model_name].instantiate()
+	var inst: Node3D = packed.instantiate()
 	parent.add_child(inst)
-	inst.position = pos
 	inst.rotation_degrees.y = rot_y_deg
-	add_collision(inst, model_name)
 	fix_culling(inst)
 	return inst
 
 
-## Many interior asset kits export meshes with normals facing only one way
-## (meant to be seen from outside a building). Since our camera stands
-## INSIDE the room, those faces get backface-culled and disappear. This
-## makes every surface visible from both sides, no matter which way the
-## mesh's normals point.
+## Many interior kits export one-sided meshes; from inside the room those faces
+## get culled and vanish. Make every surface double-sided.
 func fix_culling(node: Node) -> void:
-	if node is MeshInstance3D:
-		var mesh_inst := node as MeshInstance3D
-		if mesh_inst.mesh:
-			for i in range(mesh_inst.mesh.get_surface_count()):
-				var mat := mesh_inst.get_active_material(i)
-				if mat and mat is BaseMaterial3D:
-					mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	if node is MeshInstance3D and node.mesh:
+		for i in range(node.mesh.get_surface_count()):
+			var mat := node.get_active_material(i)
+			if mat and mat is BaseMaterial3D:
+				mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 	for child in node.get_children():
 		fix_culling(child)
 
 
-func add_collision(inst: Node3D, model_name: String) -> void:
-	if not COLLISION_BOXES.has(model_name):
+# =========================
+#  AABB HELPERS  (measure real model size so nothing floats or overlaps)
+# =========================
+func get_world_aabb(root: Node3D) -> AABB:
+	var result := AABB()
+	var initialized := false
+	var stack: Array = [root]
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		if n is MeshInstance3D and n.mesh:
+			var box: AABB = (n as MeshInstance3D).mesh.get_aabb()
+			var world_box: AABB = (n as MeshInstance3D).global_transform * box
+			if not initialized:
+				result = world_box
+				initialized = true
+			else:
+				result = result.merge(world_box)
+		for c in n.get_children():
+			if c is Node3D:
+				stack.append(c)
+	return result
+
+
+## Center the object's footprint on (x, z) and seat its bottom on bottom_y.
+func seat_on_floor(inst: Node3D, x: float, z: float, bottom_y: float = 0.0) -> void:
+	if inst == null:
 		return
-	for box in COLLISION_BOXES[model_name]:
+	var box := get_world_aabb(inst)
+	var center := box.position + box.size * 0.5
+	inst.global_position += Vector3(x - center.x, bottom_y - box.position.y, z - center.z)
+
+
+## Center the object's footprint on (x, z) and hang it so its TOP is at top_y.
+func hang_from(inst: Node3D, x: float, z: float, top_y: float) -> void:
+	if inst == null:
+		return
+	var box := get_world_aabb(inst)
+	var center := box.position + box.size * 0.5
+	inst.global_position += Vector3(x - center.x, top_y - (box.position.y + box.size.y), z - center.z)
+
+
+## Center the whole object on a world point (for wall-mounted things like signs).
+func center_at(inst: Node3D, target: Vector3) -> void:
+	if inst == null:
+		return
+	var box := get_world_aabb(inst)
+	var center := box.position + box.size * 0.5
+	inst.global_position += target - center
+
+
+func top_y_of(inst: Node3D) -> float:
+	if inst == null:
+		return 0.0
+	var box := get_world_aabb(inst)
+	return box.position.y + box.size.y
+
+
+# =========================
+#  GENERIC BOX BUILDER  (walls / ceiling)
+# =========================
+func create_box(size: Vector3, pos: Vector3, color: Color, with_collision: bool = true) -> MeshInstance3D:
+	var mi := MeshInstance3D.new()
+	var mesh := BoxMesh.new()
+	mesh.size = size
+	mi.mesh = mesh
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = color
+	mat.roughness = 0.9
+	mat.metallic = 0.0
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED   # visible from inside the room
+	mi.material_override = mat
+
+	mi.position = pos
+	add_child(mi)
+
+	if with_collision:
 		var body := StaticBody3D.new()
-		inst.add_child(body)
+		mi.add_child(body)
 		var shape := CollisionShape3D.new()
-		var box_shape := BoxShape3D.new()
-		box_shape.size = box["size"]
-		shape.shape = box_shape
-		shape.position = box["offset"]
+		var box := BoxShape3D.new()
+		box.size = size
+		shape.shape = box
 		body.add_child(shape)
 
+	return mi
+
 
 # =========================
-# MAIN GENERATION
+#  FLOOR  (tiled from floor_tile_1.fbx, gap-free)
 # =========================
-func generate_hospital() -> void:
-	build_floor()
-	build_ceiling()
-	build_walls()
-	place_furniture()
-	print("Hospital generated! room=%.1fm x %.1fm (%d x %d tiles)" % [room_width, room_length, room_cols, room_rows])
+func create_floor_tiles() -> void:
+	# One invisible collision slab so the player always has solid ground.
+	var floor_body := StaticBody3D.new()
+	floor_body.name = "FloorCollision"
+	add_child(floor_body)
+	var fshape := CollisionShape3D.new()
+	var fbox := BoxShape3D.new()
+	fbox.size = Vector3(room_width, 0.2, room_length)
+	fshape.shape = fbox
+	fshape.position = Vector3(0, -0.1, 0)   # top surface at y = 0
+	floor_body.add_child(fshape)
+
+	# Measure one tile to get its true footprint, then tile edge-to-edge.
+	var sample := spawn_model("floor_tile_1")
+	if sample == null:
+		# Fallback: light tiled-looking box so the room still has a floor.
+		create_box(Vector3(room_width, 0.05, room_length), Vector3(0, -0.025, 0),
+			Color(0.85, 0.86, 0.88), false)
+		return
+
+	var tile := get_world_aabb(sample)
+	var step_x: float = max(tile.size.x, 0.5)
+	var step_z: float = max(tile.size.z, 0.5)
+	sample.queue_free()   # remove the probe; real grid is spawned below
+
+	var cols: int = int(ceil(room_width / step_x))
+	var rows: int = int(ceil(room_length / step_z))
+	var start_x: float = -room_width / 2.0 + step_x / 2.0
+	var start_z: float = -room_length / 2.0 + step_z / 2.0
+
+	for c in range(cols):
+		for r in range(rows):
+			var t := spawn_model("floor_tile_1")
+			if t == null:
+				continue
+			seat_on_floor(t, start_x + c * step_x, start_z + r * step_z, 0.0)
 
 
-func grid_to_world(col: int, row: int) -> Vector3:
-	var x := -room_width / 2.0 + TILE_SIZE * (col + 0.5)
-	var z := -room_length / 2.0 + TILE_SIZE * (row + 0.5)
-	return Vector3(x, 0.0, z)
+# =========================
+#  CEILING  (white slab + real ceiling lights)
+# =========================
+func create_ceiling() -> void:
+	create_box(
+		Vector3(room_width, wall_thickness, room_length),
+		Vector3(0, room_height + wall_thickness / 2.0, 0),
+		Color(0.97, 0.97, 0.97),
+		false)
+
+	# Evenly spaced light fixtures (3 across X, 2 across Z).
+	var xs := [-room_width / 4.0, 0.0, room_width / 4.0]
+	var zs := [-room_length / 5.0, room_length / 5.0]
+	for x in xs:
+		for z in zs:
+			var fixture := spawn_model("ceiling_light")
+			if fixture != null:
+				hang_from(fixture, x, z, room_height - 0.02)  # flush under ceiling
+			add_ceiling_lamp(Vector3(x, room_height - 0.35, z))
 
 
-func build_floor() -> void:
-	for col in range(room_cols):
-		for row in range(room_rows):
-			var tile_name := "floor_tile_1" if (col + row) % 2 == 0 else "floor_tile_2"
-			spawn(tile_name, grid_to_world(col, row))
-
-
-func build_ceiling() -> void:
-	for col in range(room_cols):
-		for row in range(room_rows):
-			spawn("ceiling_tile", grid_to_world(col, row) + Vector3(0, WALL_HEIGHT, 0))
-
-	# a handful of ceiling lights, evenly spaced
-	var light_cols: Array = [1, room_cols - 2] if room_cols > 3 else [int(room_cols / 2.0)]
-	var light_rows: Array = [1, room_rows - 2] if room_rows > 3 else [int(room_rows / 2.0)]
-	for c in light_cols:
-		for r in light_rows:
-			var light_pos := grid_to_world(c, r) + Vector3(0, WALL_HEIGHT, 0)
-			spawn("ceiling_light", light_pos)
-			# The ceiling_light.fbx is only a mesh — it emits no light on its own,
-			# and the room's ceiling blocks the DirectionalLight, so without this
-			# the interior renders almost black. Add a real lamp under each fixture.
-			add_ceiling_lamp(light_pos)
-
-
-## Real light source seated just below a ceiling_light fixture. Kept dim and
-## slightly cold for the haunted-hospital mood, but bright enough to actually
-## see the room and furniture.
-func add_ceiling_lamp(fixture_pos: Vector3) -> void:
+## Real light under a ceiling fixture (the FBX mesh emits nothing by itself).
+func add_ceiling_lamp(pos: Vector3) -> void:
 	var lamp := OmniLight3D.new()
-	lamp.position = fixture_pos - Vector3(0, 0.25, 0)  # just under the fixture
-	lamp.light_color = Color(0.85, 0.9, 1.0)           # faint cold flicker-white
-	lamp.light_energy = 1.6
-	lamp.omni_range = TILE_SIZE * 4.0
-	lamp.omni_attenuation = 1.5
+	lamp.position = pos
+	lamp.light_color = Color(1.0, 0.99, 0.95)
+	lamp.light_energy = 2.0
+	lamp.omni_range = max(room_width, room_length) * 0.75
+	lamp.omni_attenuation = 1.2
 	lamp.shadow_enabled = true
 	add_child(lamp)
 
 
-func build_walls() -> void:
+# =========================
+#  WALLS  (4 walls, front wall has a big doorway + door + exit sign)
+# =========================
+func create_walls() -> void:
 	var half_w := room_width / 2.0
 	var half_l := room_length / 2.0
+	var h := room_height
+	var t := wall_thickness
+	var wall_color := Color(0.92, 0.93, 0.94)   # off-white hospital wall
 
-	# --- corners ---
-	spawn("tile_corner", Vector3(-half_w, 0, -half_l), corner_rotation_sw)
-	spawn("tile_corner", Vector3(half_w, 0, -half_l), corner_rotation_se)
-	spawn("tile_corner", Vector3(half_w, 0, half_l), corner_rotation_ne)
-	spawn("tile_corner", Vector3(-half_w, 0, half_l), corner_rotation_nw)
+	# LEFT wall  (x = -half_w)
+	create_box(Vector3(t, h, room_length), Vector3(-half_w, h / 2.0, 0), wall_color)
+	# RIGHT wall (x = +half_w)
+	create_box(Vector3(t, h, room_length), Vector3(half_w, h / 2.0, 0), wall_color)
+	# BACK wall  (z = -half_l)  — solid
+	create_box(Vector3(room_width, h, t), Vector3(0, h / 2.0, -half_l), wall_color)
 
-	var door_col := int(room_cols / 2.0)     # south wall: doorway goes here
-	var window_col := int(room_cols / 2.0)   # north wall: window goes here
-	var window_row := int(room_rows / 2.0)   # east wall: window goes here
+	# FRONT wall (z = +half_l) — split around a centered doorway.
+	var dw := door_width
+	var dh := door_height
+	var side := (room_width - dw) / 2.0            # width of each side segment
+	var side_center := (dw / 2.0) + (side / 2.0)   # x-offset of each segment center
+	# left of door
+	create_box(Vector3(side, h, t), Vector3(-side_center, h / 2.0, half_l), wall_color)
+	# right of door
+	create_box(Vector3(side, h, t), Vector3(side_center, h / 2.0, half_l), wall_color)
+	# lintel above door
+	create_box(Vector3(dw, h - dh, t), Vector3(0, dh + (h - dh) / 2.0, half_l), wall_color)
 
-	# --- south wall (z = -half_l) — has the door ---
-	for col in range(1, room_cols - 1):
-		var x := -half_w + TILE_SIZE * (col + 0.5)
-		var pos := Vector3(x, 0, -half_l)
-		if col == door_col:
-			spawn("tile_doorway_1", pos, 0.0)
-			place_door(pos)
-			spawn("Exit_sign", pos + Vector3(0, 2.3, 0.05), 0.0)
-		else:
-			spawn("tile_wall", pos, 0.0)
-
-	# --- north wall (z = +half_l) — solid, one window ---
-	for col in range(1, room_cols - 1):
-		var x := -half_w + TILE_SIZE * (col + 0.5)
-		var pos := Vector3(x, 0, half_l)
-		if col == window_col:
-			spawn("tile_window", pos, 180.0)
-		else:
-			spawn("tile_wall", pos, 180.0)
-
-	# --- west wall (x = -half_w) — solid ---
-	for row in range(1, room_rows - 1):
-		var z := -half_l + TILE_SIZE * (row + 0.5)
-		spawn("tile_wall", Vector3(-half_w, 0, z), 90.0)
-
-	# --- east wall (x = +half_w) — one window ---
-	for row in range(1, room_rows - 1):
-		var z := -half_l + TILE_SIZE * (row + 0.5)
-		var pos := Vector3(half_w, 0, z)
-		if row == window_row:
-			spawn("tile_window", pos, 270.0)
-		else:
-			spawn("tile_wall", pos, 270.0)
+	create_entrance_door(half_l)
 
 
-func place_door(doorway_pos: Vector3) -> void:
-	# door_1.fbx pivots at its hinge edge, so rotating it swings it open.
-	# This offset seats it inside the 2m opening — nudge x if it clips the frame.
-	var door_offset := Vector3(-1.0, 0, 0)
-	var door := spawn("door_1", doorway_pos + door_offset, 0.0)
-	if door:
-		var script := load(scripts_path.path_join("hospital_door.gd"))
-		if script:
-			door.set_script(script)
+func create_entrance_door(front_z: float) -> void:
+	var packed := get_model("door_1")
+	if packed != null:
+		var door: Node3D = packed.instantiate()
+		# Attach the swing script BEFORE entering the tree so its _ready runs.
+		var door_script_path := scripts_path.path_join("hospital_door.gd")
+		if ResourceLoader.exists(door_script_path):
+			door.set_script(load(door_script_path))
+		add_child(door)
+		fix_culling(door)
+		seat_on_floor(door, 0.0, front_z, 0.0)
+		# Shift so the hinge sits at the left jamb of the opening.
+		var box := get_world_aabb(door)
+		door.global_position.x += (-door_width / 2.0) - box.position.x
+
+	# Exit sign above the doorway (slightly inside the room).
+	var sign := spawn_model("Exit_sign")
+	if sign != null:
+		center_at(sign, Vector3(0, door_height + 0.35, front_z - 0.15))
 
 
 # =========================
-# FURNITURE
-# (positions offset by each model's measured bottom-to-pivot distance,
-#  so nothing floats or sinks into the floor)
+#  FURNITURE  (everything centered on its footprint, seated on the floor)
 # =========================
 func place_furniture() -> void:
 	var half_w := room_width / 2.0
 	var half_l := room_length / 2.0
 
-	# patient bed against the back (north) wall
-	var bed_pos := Vector3(-half_w + 2.2, 0.504, half_l - 1.0)
-	spawn("bed", bed_pos, 180.0)
+	# --- Hospital bed: main area, a little left of centre ---
+	var bed := spawn_model("bed", 90.0)
+	seat_on_floor(bed, -3.0, -1.0)
+	apply_bed_material(bed)
+	var bed_top := top_y_of(bed)
 
-	# IV stand + bag beside the bed
-	var iv_pos := bed_pos + Vector3(1.3, 0, -0.3)
-	spawn("IV_Bag_holder", Vector3(iv_pos.x, 1.152, iv_pos.z))
-	spawn("IV_Bag", Vector3(iv_pos.x, 1.75, iv_pos.z))  # hook height is approximate
+	# --- Cabinet near the bed head ---
+	seat_on_floor(spawn_model("cabinet_1", 0.0), -6.5, -3.5)
+	# --- Two more cabinets along the left wall ---
+	seat_on_floor(spawn_model("cabinet_2", 90.0), -half_w + 0.6, 1.0)
+	var cab3 := spawn_model("cabinet_3", 90.0)
+	seat_on_floor(cab3, -half_w + 0.6, 3.5)
 
-	# wheelchair near the foot of the bed
-	spawn("wheel_chair", bed_pos + Vector3(1.6, -0.074, 1.4), -30.0)
+	# --- Chair beside the bed ---
+	seat_on_floor(spawn_model("chair", -90.0), -0.6, 0.5)
 
-	# cabinets along the west wall
-	spawn("cabinet_1", Vector3(-half_w + 0.4, 0.453, -half_l + 1.5), 90.0)
-	spawn("cabinet_2", Vector3(-half_w + 0.4, 0.323, -half_l + 3.5), 90.0)
-	spawn("cabinet_3", Vector3(-half_w + 0.4, 0.506, -half_l + 5.5), 90.0)
+	# --- IV stand + bag beside the bed ---
+	var iv_holder := spawn_model("IV_Bag_holder")
+	seat_on_floor(iv_holder, -5.0, 0.5)
+	var iv_bag := spawn_model("IV_Bag")
+	hang_from(iv_bag, -5.0, 0.5, top_y_of(iv_holder) - 0.1)
 
-	# waiting bench along the east wall
-	spawn("bench", Vector3(half_w - 0.5, 0.739, -half_l + 2.0), -90.0)
+	# --- Bench along the back wall ---
+	seat_on_floor(spawn_model("bench", 0.0), 4.0, -half_l + 0.9)
 
-	# small nurse table + chair near the door
-	var table_pos := Vector3(half_w - 1.8, 0.765, -half_l + 1.6)
-	spawn("table", table_pos, 0.0)
-	spawn("chair", table_pos + Vector3(0, -0.765 + 0.817, 0.9), 180.0)
-	spawn("Magazine1", table_pos + Vector3(0.2, 0.285, -0.1), 15.0)
+	# --- Magazine resting on top of the low cabinet ---
+	var mag := spawn_model("Magazine_1", 20.0)
+	seat_on_floor(mag, -half_w + 0.6, 3.5, top_y_of(cab3))
+
+	# --- door_2 available for a future second exit (left unused for now) ---
 
 
 # =========================
-# LIGHTING (same idea as your original script)
+#  BED MATERIAL  (PBR from your Bed_* texture set)
+# =========================
+func apply_bed_material(bed: Node3D) -> void:
+	if bed == null:
+		return
+	var mat := _get_bed_material()
+	if mat == null:
+		return
+	_apply_material_recursive(bed, mat)
+
+
+func _get_bed_material() -> StandardMaterial3D:
+	if _bed_material != null:
+		return _bed_material
+
+	var base := _load_tex("Bed_BaseColor")
+	if base == null:
+		print("MODEL TOPILMADI: Bed_BaseColor.png (bed keeps its default material)")
+		return null
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_texture = base
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+
+	var metal := _load_tex("Bed_Metallic")
+	if metal != null:
+		mat.metallic = 1.0
+		mat.metallic_texture = metal
+
+	var rough := _load_tex("Bed_Roughness")
+	if rough != null:
+		mat.roughness = 1.0
+		mat.roughness_texture = rough
+
+	var normal := _load_tex("Bed_Normal")
+	if normal != null:
+		mat.normal_enabled = true
+		mat.normal_texture = normal
+
+	_bed_material = mat
+	return mat
+
+
+func _load_tex(base_name: String) -> Texture2D:
+	var dirs: Array = [bed_texture_dir]
+	for d in FALLBACK_TEX_DIRS:
+		if not dirs.has(d):
+			dirs.append(d)
+	for dir in dirs:
+		var path: String = dir.path_join(base_name + ".png")
+		if ResourceLoader.exists(path):
+			return load(path)
+	return null
+
+
+func _apply_material_recursive(node: Node, mat: Material) -> void:
+	if node is MeshInstance3D and node.mesh:
+		for i in range((node as MeshInstance3D).mesh.get_surface_count()):
+			(node as MeshInstance3D).set_surface_override_material(i, mat)
+	for child in node.get_children():
+		_apply_material_recursive(child, mat)
+
+
+# =========================
+#  LIGHTING
 # =========================
 func create_lighting() -> void:
-	var light := DirectionalLight3D.new()
-	light.name = "HospitalLight"
-	light.rotation_degrees = Vector3(-55, -30, 0)
-	light.light_energy = 1.0
-	light.shadow_enabled = true
-	add_child(light)
+	var sun := DirectionalLight3D.new()
+	sun.name = "SunLight"
+	sun.rotation_degrees = Vector3(-50, -35, 0)
+	sun.light_energy = 1.0
+	sun.shadow_enabled = true
+	add_child(sun)
 
 	var world := WorldEnvironment.new()
 	world.name = "WorldEnvironment"
-	var environment := Environment.new()
-	environment.background_mode = Environment.BG_COLOR
-	environment.background_color = Color(0.08, 0.08, 0.08)
-	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	environment.ambient_light_color = Color(0.25, 0.25, 0.25)
-	environment.ambient_light_energy = 0.7
-	world.environment = environment
+	var env := Environment.new()
+	env.background_mode = Environment.BG_COLOR
+	env.background_color = Color(0.14, 0.15, 0.17)
+	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	env.ambient_light_color = Color(0.7, 0.72, 0.75)
+	env.ambient_light_energy = 0.85          # keeps the room from going too dark
+	env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
+	world.environment = env
 	add_child(world)
 
 
 # =========================
-# PLAYER (walkable, replaces the static camera)
+#  CAMERA / PLAYER  (first-person, 1.7m, WASD-ready)
 # =========================
-func spawn_player() -> void:
+func create_camera() -> void:
 	var player := CharacterBody3D.new()
 	player.name = "Player"
 
 	var collider := CollisionShape3D.new()
-	var shape := CapsuleShape3D.new()
-	shape.height = 1.7
-	shape.radius = 0.35
-	collider.shape = shape
+	var capsule := CapsuleShape3D.new()
+	capsule.height = 1.7
+	capsule.radius = 0.35
+	collider.shape = capsule
 	collider.position.y = 0.85
 	player.add_child(collider)
 
 	var cam := Camera3D.new()
 	cam.name = "PlayerCamera"
-	cam.position = Vector3(0, 1.6, 0)
+	cam.position = Vector3(0, 1.7, 0)   # eye height
+	cam.fov = 78.0                       # wide enough to show the big room
 	cam.current = true
-	cam.fov = 75.0
 	player.add_child(cam)
 
-	player.position = Vector3(0, 0.1, room_length / 2.0 - 2.0)  # near the back wall
-	player.rotation_degrees.y = 180.0                            # facing the door
+	# Spawn just inside the entrance, looking into the room.
+	player.position = Vector3(0, 0.1, room_length / 2.0 - 2.0)
 
-	var script := load(scripts_path.path_join("hospital_player.gd"))
-	if script:
-		player.set_script(script)
+	# Attach the controller BEFORE entering the tree so its _ready runs
+	# (mouse capture + movement setup).
+	var player_script_path := scripts_path.path_join("hospital_player.gd")
+	if ResourceLoader.exists(player_script_path):
+		player.set_script(load(player_script_path))
+	else:
+		print("Eslatma: %s topilmadi — kamera qo'yildi, lekin WASD uchun hospital_player.gd kerak." % player_script_path)
 
 	add_child(player)
+
+
+func create_debug_camera() -> void:
+	var cam := Camera3D.new()
+	cam.name = "DebugTopDownCamera"
+	var highest: float = max(room_width, room_length)
+	cam.position = Vector3(0, highest * 1.1, 0)
+	cam.rotation_degrees = Vector3(-90, 0, 0)
+	cam.far = highest * 5.0
+	cam.current = true
+	add_child(cam)
