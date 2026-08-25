@@ -4,4 +4,4 @@
 
 [node name="Hospital" type="Node3D" unique_id=327092270]
 script = ExtResource("1_w4y8d")
-debug_top_down = true
+debug_top_down = false
