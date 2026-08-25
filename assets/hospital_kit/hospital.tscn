@@ -1,0 +1,7 @@
+[gd_scene format=3 uid="uid://q1t1q2ppdsjf"]
+
+[ext_resource type="Script" uid="uid://16ckfepk7ps2" path="res://hospital_generator.gd" id="1_w4y8d"]
+
+[node name="Hospital" type="Node3D" unique_id=327092270]
+script = ExtResource("1_w4y8d")
+debug_top_down = true
