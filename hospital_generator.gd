@@ -201,7 +201,26 @@ func build_ceiling() -> void:
 	var light_rows: Array = [1, room_rows - 2] if room_rows > 3 else [int(room_rows / 2.0)]
 	for c in light_cols:
 		for r in light_rows:
-			spawn("ceiling_light", grid_to_world(c, r) + Vector3(0, WALL_HEIGHT, 0))
+			var light_pos := grid_to_world(c, r) + Vector3(0, WALL_HEIGHT, 0)
+			spawn("ceiling_light", light_pos)
+			# The ceiling_light.fbx is only a mesh — it emits no light on its own,
+			# and the room's ceiling blocks the DirectionalLight, so without this
+			# the interior renders almost black. Add a real lamp under each fixture.
+			add_ceiling_lamp(light_pos)
+
+
+## Real light source seated just below a ceiling_light fixture. Kept dim and
+## slightly cold for the haunted-hospital mood, but bright enough to actually
+## see the room and furniture.
+func add_ceiling_lamp(fixture_pos: Vector3) -> void:
+	var lamp := OmniLight3D.new()
+	lamp.position = fixture_pos - Vector3(0, 0.25, 0)  # just under the fixture
+	lamp.light_color = Color(0.85, 0.9, 1.0)           # faint cold flicker-white
+	lamp.light_energy = 1.6
+	lamp.omni_range = TILE_SIZE * 4.0
+	lamp.omni_attenuation = 1.5
+	lamp.shadow_enabled = true
+	add_child(lamp)
 
 
 func build_walls() -> void:
