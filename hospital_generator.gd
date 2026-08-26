@@ -40,6 +40,19 @@ extends Node3D
 ## Folder with the Bed_BaseColor.png / Bed_Normal.png / ... texture set.
 @export var bed_texture_dir: String = "res://models/textures/bed/"
 
+@export_group("Monster")
+## Turn the whole stalker + horror-director system on/off.
+@export var enable_monster: bool = true
+## Folder that holds your monster model. A missing model is fine — a dark
+## placeholder figure is spawned so the AI is still testable.
+@export var monster_dir: String = "res://assets/monster/"
+## Base file name of the monster model (without extension). .glb then .fbx
+## are tried.
+@export var monster_file: String = "monster"
+@export var monster_scale: float = 1.0
+## Seconds of calm exploration before the monster starts hunting.
+@export var monster_intro_seconds: float = 22.0
+
 @export_group("Debug")
 ## Fixed camera high above the room, looking straight down. Handy for checking
 ## the layout. Ships OFF so the game is playable in first person.
@@ -58,6 +71,8 @@ const NAME_ALIASES := {
 
 var _models: Dictionary = {}   # logical name -> PackedScene (only ones found)
 var _bed_material: StandardMaterial3D = null
+var _ceiling_lamps: Array = []  # OmniLight3D fixtures (flickered by the director)
+var _player: Node3D = null
 
 
 # =========================
@@ -74,6 +89,8 @@ func _ready() -> void:
 		create_debug_camera()
 	else:
 		create_camera()
+		if enable_monster:
+			spawn_monster_system()
 	print("Hospital ward ready: %.1fm x %.1fm x %.1fm" % [room_width, room_length, room_height])
 
 
@@ -86,6 +103,8 @@ func _ensure_input_actions() -> void:
 		"move_left": KEY_A,
 		"move_right": KEY_D,
 		"interact": KEY_E,
+		"run": KEY_SHIFT,
+		"flashlight": KEY_F,
 	}
 	for action in binds:
 		if not InputMap.has_action(action):
@@ -307,6 +326,7 @@ func add_ceiling_lamp(pos: Vector3) -> void:
 	lamp.omni_attenuation = 1.2
 	lamp.shadow_enabled = true
 	add_child(lamp)
+	_ceiling_lamps.append(lamp)
 
 
 # =========================
@@ -511,8 +531,19 @@ func create_camera() -> void:
 	cam.current = true
 	player.add_child(cam)
 
+	# Flashlight on the camera (toggle with F). Points where you look.
+	var torch := SpotLight3D.new()
+	torch.name = "Flashlight"
+	torch.spot_range = 18.0
+	torch.spot_angle = 32.0
+	torch.light_energy = 4.0
+	torch.light_color = Color(1.0, 0.97, 0.9)
+	torch.shadow_enabled = true
+	cam.add_child(torch)
+
 	# Spawn just inside the entrance, looking into the room.
 	player.position = Vector3(0, 0.1, room_length / 2.0 - 2.0)
+	_player = player
 
 	# Attach the controller BEFORE entering the tree so its _ready runs
 	# (mouse capture + movement setup).
@@ -534,3 +565,126 @@ func create_debug_camera() -> void:
 	cam.far = highest * 5.0
 	cam.current = true
 	add_child(cam)
+
+
+# =========================
+#  MONSTER + HORROR DIRECTOR
+# =========================
+func spawn_monster_system() -> void:
+	var half_w := room_width / 2.0
+	var half_l := room_length / 2.0
+
+	var monster = create_monster(Vector3(-half_w + 2.0, 0.1, -half_l + 2.0))
+	if monster == null:
+		return
+
+	# Patrol loop around the room perimeter.
+	var pts: Array[Vector3] = [
+		Vector3(-half_w + 2.0, 0.1, -half_l + 2.0),
+		Vector3(half_w - 2.0, 0.1, -half_l + 2.0),
+		Vector3(half_w - 2.0, 0.1, half_l - 3.0),
+		Vector3(-half_w + 2.0, 0.1, half_l - 3.0),
+	]
+	monster.patrol_points = pts
+
+	# First-glimpse spot: far end of the room, in front of the entrance.
+	var glimpse := Vector3(0.0, 0.1, -half_l + 2.5)
+
+	var dir_script_path := scripts_path.path_join("horror_director.gd")
+	if not ResourceLoader.exists(dir_script_path):
+		print("MODEL TOPILMADI: %s (director yo'q — monster oddiy patrulda qoladi)" % dir_script_path)
+		monster.active = true          # no director: just let it hunt right away
+		monster.visible = true
+		return
+
+	var director = Node.new()
+	director.name = "HorrorDirector"
+	director.set_script(load(dir_script_path))
+	director.intro_duration = monster_intro_seconds
+	director.setup(monster, _player, _ceiling_lamps, glimpse)
+	add_child(director)
+
+
+func create_monster(pos: Vector3) -> Node:
+	var ai_script_path := scripts_path.path_join("monster_ai.gd")
+	if not ResourceLoader.exists(ai_script_path):
+		print("MODEL TOPILMADI: %s (monster_ai.gd yo'q)" % ai_script_path)
+		return null
+
+	var body := CharacterBody3D.new()
+	body.name = "Monster"
+
+	var collider := CollisionShape3D.new()
+	var capsule := CapsuleShape3D.new()
+	capsule.height = 1.8
+	capsule.radius = 0.4
+	collider.shape = capsule
+	collider.position.y = 0.9
+	body.add_child(collider)
+
+	# Real model if present, otherwise a dark placeholder figure.
+	var model := _load_monster_model()
+	if model != null:
+		model.scale = Vector3(monster_scale, monster_scale, monster_scale)
+		body.add_child(model)
+		fix_culling(model)
+	else:
+		print("MODEL TOPILMADI: %s%s(.glb/.fbx) — placeholder figura ishlatilmoqda" % [monster_dir, monster_file])
+		var mesh := MeshInstance3D.new()
+		mesh.name = "MonsterMesh"
+		var cm := CapsuleMesh.new()
+		cm.height = 1.8
+		cm.radius = 0.4
+		mesh.mesh = cm
+		mesh.position.y = 0.9
+		var mat := StandardMaterial3D.new()
+		mat.albedo_color = Color(0.04, 0.04, 0.05)
+		mat.roughness = 1.0
+		mesh.material_override = mat
+		body.add_child(mesh)
+
+	# Attach the AI BEFORE entering the tree so its _ready finds the model.
+	body.set_script(load(ai_script_path))
+	body.position = pos
+	add_child(body)
+	return body
+
+
+func _load_monster_model() -> Node3D:
+	# 1) monster_dir is itself a full path to the file.
+	if monster_dir.ends_with(".glb") or monster_dir.ends_with(".fbx"):
+		if ResourceLoader.exists(monster_dir):
+			return (load(monster_dir) as PackedScene).instantiate() as Node3D
+		return null
+
+	# 2) named file (monster_file) in a few likely folders.
+	var dirs := [monster_dir, "res://assets/monster/", "res://models/monster/", "res://models/"]
+	for d in dirs:
+		for ext in [".glb", ".fbx"]:
+			var p: String = d.path_join(monster_file + ext)
+			if ResourceLoader.exists(p):
+				return (load(p) as PackedScene).instantiate() as Node3D
+
+	# 3) last resort: use ANY .glb/.fbx found inside the monster folder,
+	#    whatever it's called.
+	var found := _scan_dir_for_model(monster_dir)
+	if found != "":
+		return (load(found) as PackedScene).instantiate() as Node3D
+	return null
+
+
+func _scan_dir_for_model(dir_path: String) -> String:
+	var da := DirAccess.open(dir_path)
+	if da == null:
+		return ""
+	da.list_dir_begin()
+	var fname := da.get_next()
+	while fname != "":
+		if not da.current_is_dir():
+			var low := fname.to_lower()
+			if low.ends_with(".glb") or low.ends_with(".fbx"):
+				da.list_dir_end()
+				return dir_path.path_join(fname)
+		fname = da.get_next()
+	da.list_dir_end()
+	return ""
