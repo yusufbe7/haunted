@@ -66,6 +66,7 @@ const NAME_ALIASES := {
 }
 
 var _models: Dictionary = {}
+var _mats: Dictionary = {}          # cached materials, see MATERIAL PALETTE
 var _bed_material: StandardMaterial3D = null
 var _ceiling_material: StandardMaterial3D = null
 var _ceiling_lamps: Array = []
@@ -240,6 +241,151 @@ func solid_color_material(color: Color) -> StandardMaterial3D:
 
 
 # =========================
+#  MATERIAL PALETTE
+#  Sampled from the Modular Hospital reference footage: cream walls banded
+#  with hospital green (baseboard, chair rail, crown), white tile in the
+#  public areas and pale green lino in the wards.
+# =========================
+func mat_wall_cream() -> StandardMaterial3D:
+	if not _mats.has("cream"):
+		var m := solid_color_material(Color(0.88, 0.87, 0.83))
+		m.roughness = 0.95
+		_mats["cream"] = m
+	return _mats["cream"]
+
+
+func mat_green() -> StandardMaterial3D:
+	if not _mats.has("green"):
+		var m := solid_color_material(Color(0.34, 0.51, 0.36))
+		m.roughness = 0.75      # painted trim is a little glossier than plaster
+		_mats["green"] = m
+	return _mats["green"]
+
+
+func mat_lino_green() -> StandardMaterial3D:
+	if not _mats.has("lino"):
+		var m := solid_color_material(Color(0.55, 0.68, 0.55))
+		m.roughness = 0.35      # polished linoleum catches the ceiling lights
+		m.metallic_specular = 0.6
+		_mats["lino"] = m
+	return _mats["lino"]
+
+
+func mat_dark_screen() -> StandardMaterial3D:
+	if not _mats.has("screen"):
+		var m := solid_color_material(Color(0.03, 0.05, 0.05))
+		m.roughness = 0.18
+		_mats["screen"] = m
+	return _mats["screen"]
+
+
+func mat_vent() -> StandardMaterial3D:
+	if not _mats.has("vent"):
+		var m := solid_color_material(Color(0.16, 0.16, 0.15))
+		m.roughness = 0.55
+		m.metallic = 0.5
+		_mats["vent"] = m
+	return _mats["vent"]
+
+
+## Flat recessed light panel set into the ceiling — emissive so the fixture
+## itself reads as lit, the way the reference ceilings do.
+func mat_light_panel(on: bool) -> StandardMaterial3D:
+	var key := "panel_on" if on else "panel_off"
+	if not _mats.has(key):
+		var m := solid_color_material(Color(0.92, 0.92, 0.88) if on else Color(0.35, 0.36, 0.34))
+		if on:
+			m.emission_enabled = true
+			m.emission = Color(1.0, 0.97, 0.9)
+			m.emission_energy_multiplier = 1.6
+		_mats[key] = m
+	return _mats[key]
+
+
+# =========================
+#  BANDED WALLS  (the signature look of the reference kit)
+# =========================
+## Horizontal band layout, in metres from the floor. Real hospital trim
+## heights: a low skirting, a chair rail around 1.0-1.3m, a crown band
+## tucked under the ceiling.
+const BASEBOARD_TOP := 0.14
+const RAIL_BOTTOM := 1.00
+const RAIL_TOP := 1.30
+const CROWN_DEPTH := 0.22     # measured down from the ceiling
+
+
+## One wall segment: a single full-height collider plus the stack of coloured
+## strips that give it the banded look. `along_x` picks the orientation.
+func build_wall_segment(a_start: float, a_end: float, fixed: float, along_x: bool) -> void:
+	var length: float = a_end - a_start
+	if length < 0.01:
+		return
+	var a_center: float = (a_start + a_end) / 2.0
+	var t := wall_thickness
+
+	# --- one collider for the whole segment (physics stays cheap) ---
+	var body := StaticBody3D.new()
+	add_child(body)
+	var shape := CollisionShape3D.new()
+	var box := BoxShape3D.new()
+	box.size = Vector3(length, room_height, t) if along_x else Vector3(t, room_height, length)
+	shape.shape = box
+	shape.position = Vector3(a_center, room_height / 2.0, fixed) if along_x \
+		else Vector3(fixed, room_height / 2.0, a_center)
+	body.add_child(shape)
+
+	# --- visual strips, bottom to top ---
+	var crown_bottom: float = room_height - CROWN_DEPTH
+	var strips := [
+		[0.0, BASEBOARD_TOP, mat_green()],          # skirting
+		[BASEBOARD_TOP, RAIL_BOTTOM, mat_wall_cream()],
+		[RAIL_BOTTOM, RAIL_TOP, mat_green()],       # chair rail
+		[RAIL_TOP, crown_bottom, mat_wall_cream()],
+		[crown_bottom, room_height, mat_green()],   # crown band
+	]
+	for s in strips:
+		var y0: float = s[0]
+		var y1: float = s[1]
+		var h: float = y1 - y0
+		if h <= 0.001:
+			continue
+		# Trim sits a hair proud of the plaster so the bands catch the light.
+		var depth: float = t + (0.02 if s[2] == mat_green() else 0.0)
+		var size := Vector3(length, h, depth) if along_x else Vector3(depth, h, length)
+		var pos := Vector3(a_center, y0 + h / 2.0, fixed) if along_x \
+			else Vector3(fixed, y0 + h / 2.0, a_center)
+		create_box(size, pos, s[2], false)
+
+
+## Square pillar with the same banding, like the ones in the reference lobby.
+func build_pillar(x: float, z: float, width: float = 0.55) -> void:
+	var body := StaticBody3D.new()
+	add_child(body)
+	var shape := CollisionShape3D.new()
+	var box := BoxShape3D.new()
+	box.size = Vector3(width, room_height, width)
+	shape.shape = box
+	shape.position = Vector3(x, room_height / 2.0, z)
+	body.add_child(shape)
+
+	var crown_bottom: float = room_height - CROWN_DEPTH
+	var strips := [
+		[0.0, BASEBOARD_TOP, mat_green()],
+		[BASEBOARD_TOP, RAIL_BOTTOM, mat_wall_cream()],
+		[RAIL_BOTTOM, RAIL_TOP, mat_green()],
+		[RAIL_TOP, crown_bottom, mat_wall_cream()],
+		[crown_bottom, room_height, mat_green()],
+	]
+	for s in strips:
+		var y0: float = s[0]
+		var h: float = s[1] - y0
+		if h <= 0.001:
+			continue
+		var w: float = width + (0.03 if s[2] == mat_green() else 0.0)
+		create_box(Vector3(w, h, w), Vector3(x, y0 + h / 2.0, z), s[2], false)
+
+
+# =========================
 #  FLOOR PLAN — top level
 # =========================
 func build_floor_plan() -> void:
@@ -337,6 +483,13 @@ func build_floor_plan() -> void:
 	add_room_light((b_xmin - corr_half2) / 2.0, bcz, true)   # storage flickers
 	add_room_light(entrance_x, bcz, false)
 
+	# Pillars in the open public areas, banded like the reference lobby.
+	var lobby_cz: float = (bottom_z[0] + bottom_z[1]) / 2.0
+	build_pillar(corridor_w / 2.0 + 1.8, lobby_cz)
+	build_pillar(b_xmax - 2.2, lobby_cz)
+	build_pillar(-corridor_w / 2.0 - 1.8, band_cz)
+	build_pillar(corridor_w / 2.0 + 1.8, band_cz)
+
 	# main entrance door + exit sign (south wall runs along X -> faces_x = false)
 	place_door_at(Vector3(entrance_x, 0.0, b_zmin), false, entrance_gap)
 	var sign := spawn_model("Exit_sign")
@@ -390,6 +543,22 @@ func build_ceiling() -> void:
 		_get_ceiling_material(),
 		false)
 
+	# Dark vent grilles set into the tiles, scattered on a coarse grid — the
+	# reference ceilings are dotted with these.
+	var y: float = room_height - 0.02
+	var step := 7.0
+	var gx: int = int((b_xmax - b_xmin) / step)
+	var gz: int = int((b_zmax - b_zmin) / step)
+	for i in range(gx + 1):
+		for j in range(gz + 1):
+			if (i + j) % 2 == 1:
+				continue
+			var x: float = b_xmin + 2.5 + i * step
+			var z: float = b_zmin + 3.0 + j * step
+			if x > b_xmax - 1.0 or z > b_zmax - 1.0:
+				continue
+			create_box(Vector3(0.62, 0.05, 0.62), Vector3(x, y, z), mat_vent(), false)
+
 
 # =========================
 #  WALL BUILDERS
@@ -411,28 +580,46 @@ func _solid_spans(a1: float, a2: float, gaps: Array) -> Array:
 	return spans
 
 
-func _wall_material() -> StandardMaterial3D:
-	return solid_color_material(Color(0.92, 0.93, 0.94))
-
-
-## Wall running along X at fixed z.
+## Wall running along X at fixed z (banded).
 func build_wall_x(z: float, x1: float, x2: float, gaps: Array) -> void:
 	for s in _solid_spans(x1, x2, gaps):
-		var length: float = s[1] - s[0]
-		if length < 0.01:
-			continue
-		create_box(Vector3(length, room_height, wall_thickness),
-			Vector3((s[0] + s[1]) / 2.0, room_height / 2.0, z), _wall_material())
+		build_wall_segment(s[0], s[1], z, true)
+	# Header above each doorway, so openings read as framed doors.
+	for g in gaps:
+		build_door_header(g[0], g[1], z, true)
 
 
-## Wall running along Z at fixed x.
+## Wall running along Z at fixed x (banded).
 func build_wall_z(x: float, z1: float, z2: float, gaps: Array) -> void:
 	for s in _solid_spans(z1, z2, gaps):
-		var length: float = s[1] - s[0]
-		if length < 0.01:
+		build_wall_segment(s[0], s[1], x, false)
+	for g in gaps:
+		build_door_header(g[0], g[1], x, false)
+
+
+## The bit of wall above a door opening (lintel + the crown band crossing it).
+func build_door_header(center: float, width: float, fixed: float, along_x: bool) -> void:
+	var head_h := 2.15                       # top of the door opening
+	if room_height - head_h <= 0.02:
+		return
+	var h: float = room_height - head_h
+	var crown_bottom: float = room_height - CROWN_DEPTH
+	var t := wall_thickness
+	var parts := [
+		[head_h, min(crown_bottom, room_height), mat_wall_cream()],
+		[crown_bottom, room_height, mat_green()],
+	]
+	for p in parts:
+		var y0: float = p[0]
+		var y1: float = p[1]
+		if y1 - y0 <= 0.001:
 			continue
-		create_box(Vector3(wall_thickness, room_height, length),
-			Vector3(x, room_height / 2.0, (s[0] + s[1]) / 2.0), _wall_material())
+		var ph: float = y1 - y0
+		var depth: float = t + (0.02 if p[2] == mat_green() else 0.0)
+		var size := Vector3(width, ph, depth) if along_x else Vector3(depth, ph, width)
+		var pos := Vector3(center, y0 + ph / 2.0, fixed) if along_x \
+			else Vector3(fixed, y0 + ph / 2.0, center)
+		create_box(size, pos, p[2], false)
 
 
 func place_door_at(opening: Vector3, faces_x: bool, width: float = 0.0) -> void:
@@ -460,6 +647,9 @@ func furnish_ward(xmin: float, xmax: float, zmin: float, zmax: float, outer_dir:
 	var inner_x := xmax if outer_dir < 0.0 else xmin
 	var into := -outer_dir   # direction from outer wall toward the room interior
 
+	# Wards get pale green lino; the public areas keep the white tile.
+	build_lino_floor(xmin, xmax, zmin, zmax)
+
 	# Bed against the outer wall.
 	var bed_x := outer_x + into * 1.6
 	var bed := spawn_model("bed", 90.0 if outer_dir < 0.0 else 270.0)
@@ -485,11 +675,40 @@ func furnish_ward(xmin: float, xmax: float, zmin: float, zmax: float, outer_dir:
 	create_box(Vector3(0.35, 0.5, 0.35), Vector3(inner_x - into * 0.5, 0.25, zmin + 0.5),
 		solid_color_material(Color(0.12, 0.13, 0.14)), false)
 
-	# Wall poster on the outer wall, above the bed.
-	var poster_col := Color(0.75, 0.78, 0.7) if randf() > 0.5 else Color(0.6, 0.7, 0.78)
-	create_box(Vector3(0.05, 0.8, 1.1),
-		Vector3(outer_x + into * (wall_thickness / 2.0 + 0.03), 2.3, cz),
-		solid_color_material(poster_col), false)
+	# Wall-mounted monitor on the outer wall, above the bed — the reference
+	# wards all have one of these dark screens in a pale surround.
+	build_wall_screen(outer_x, cz, into, 2.05, 1.15, 0.72)
+
+
+## Dark screen in a pale surround, mounted flat on a wall that faces ±X.
+## `into` is +1/-1: the direction from the wall into the room.
+func build_wall_screen(wall_x: float, z: float, into: float, y: float,
+		w: float = 1.15, h: float = 0.72) -> void:
+	var base_x: float = wall_x + into * (wall_thickness / 2.0)
+	# pale surround
+	create_box(Vector3(0.04, h + 0.14, w + 0.14), Vector3(base_x + into * 0.02, y, z),
+		mat_wall_cream(), false)
+	# screen
+	create_box(Vector3(0.04, h, w), Vector3(base_x + into * 0.05, y, z),
+		mat_dark_screen(), false)
+
+
+## Pale green linoleum sheet covering a ward floor, laid just over the tiles.
+func build_lino_floor(xmin: float, xmax: float, zmin: float, zmax: float) -> void:
+	var inset := wall_thickness / 2.0
+	create_box(
+		Vector3(xmax - xmin - inset, 0.02, zmax - zmin - inset),
+		Vector3((xmin + xmax) / 2.0, 0.012, (zmin + zmax) / 2.0),
+		mat_lino_green(), false)
+
+
+## Recessed ceiling fixtures: a flat glowing panel, plus a dark vent grille
+## a little way off — both are everywhere in the reference footage.
+func build_ceiling_fittings(x: float, z: float, lit: bool) -> void:
+	var y: float = room_height - 0.015
+	create_box(Vector3(1.15, 0.03, 0.42), Vector3(x, y, z), mat_light_panel(lit), false)
+	create_box(Vector3(0.55, 0.04, 0.55), Vector3(x + 1.6, y - 0.005, z + 1.1),
+		mat_vent(), false)
 
 
 func furnish_nurse(xmin: float, xmax: float, zmin: float, zmax: float) -> void:
@@ -507,9 +726,13 @@ func furnish_nurse(xmin: float, xmax: float, zmin: float, zmax: float) -> void:
 func furnish_reception(xmin: float, xmax: float, zmin: float, zmax: float) -> void:
 	var cx := (xmin + xmax) / 2.0
 	var cz := (zmin + zmax) / 2.0
-	seat_on_floor(spawn_model("bench", 0.0), cx, zmax - 0.9)
-	seat_on_floor(spawn_model("bench", 0.0), cx + 2.5, zmax - 0.9)
+	# Benches lined up along the wall, as in the reference waiting area.
+	seat_on_floor(spawn_model("bench", 0.0), cx - 1.4, zmax - 0.9)
+	seat_on_floor(spawn_model("bench", 0.0), cx + 1.4, zmax - 0.9)
 	seat_on_floor(spawn_model("cabinet_1", -90.0), xmax - 0.6, cz)
+	# Waiting-room screens on the far wall.
+	build_wall_screen(xmax, cz - 2.0, -1.0, 2.05)
+	build_wall_screen(xmax, cz + 2.0, -1.0, 2.05)
 
 
 func furnish_storage(xmin: float, xmax: float, zmin: float, zmax: float) -> void:
@@ -530,19 +753,25 @@ func add_room_light(x: float, z: float, broken: bool, cast_shadow: bool = true) 
 	var fixture := spawn_model("ceiling_light")
 	if fixture != null:
 		hang_from(fixture, x, z, room_height - 0.02)
+	else:
+		# No fixture model — build the recessed panel + vent ourselves so the
+		# ceiling still reads like the reference.
+		build_ceiling_fittings(x, z, not broken)
 	var lamp := OmniLight3D.new()
-	lamp.position = Vector3(x, room_height - 0.4, z)
-	lamp.light_color = Color(1.0, 0.98, 0.94)
-	lamp.omni_range = max(ward_w, ward_l) * 1.6
-	lamp.omni_attenuation = 1.3
+	lamp.position = Vector3(x, room_height - 0.35, z)
+	lamp.light_color = Color(1.0, 0.96, 0.88)      # slightly warm tube light
+	lamp.omni_range = max(ward_w, ward_l) * 1.35
+	lamp.omni_attenuation = 1.9                     # falls off fast -> pools of light
 	lamp.shadow_enabled = cast_shadow and not broken
+	lamp.light_specular = 0.6
 	if broken:
-		lamp.light_energy = 1.6
+		lamp.light_energy = 2.2
 		var fl_path := scripts_path.path_join("flicker_light.gd")
 		if ResourceLoader.exists(fl_path):
 			lamp.set_script(load(fl_path))
+			lamp.set("on_energy", 2.2)
 	else:
-		lamp.light_energy = 1.7
+		lamp.light_energy = 2.4
 	add_child(lamp)
 	_ceiling_lamps.append(lamp)
 
@@ -632,11 +861,15 @@ func _apply_material_recursive(node: Node, mat: Material) -> void:
 # =========================
 #  LIGHTING ENVIRONMENT
 # =========================
+## Lighting tuned against the reference footage: the interior is dark and the
+## ceiling fixtures carry it, so the corridors fall into pools of light and
+## shadow instead of being evenly bright.
 func create_lighting() -> void:
 	var sun := DirectionalLight3D.new()
 	sun.name = "SunLight"
-	sun.rotation_degrees = Vector3(-55, -30, 0)
-	sun.light_energy = 0.5      # mostly blocked by the ceiling; ceiling lamps do the work
+	sun.rotation_degrees = Vector3(-58, -34, 0)
+	sun.light_energy = 0.18                       # only leaks in; ceiling lamps do the work
+	sun.light_color = Color(0.72, 0.80, 0.95)     # cold daylight through the windows
 	sun.shadow_enabled = true
 	add_child(sun)
 
@@ -644,11 +877,30 @@ func create_lighting() -> void:
 	world.name = "WorldEnvironment"
 	var env := Environment.new()
 	env.background_mode = Environment.BG_COLOR
-	env.background_color = Color(0.05, 0.05, 0.06)
+	env.background_color = Color(0.02, 0.025, 0.03)
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.ambient_light_color = Color(0.45, 0.47, 0.5)
-	env.ambient_light_energy = 0.45   # dim + moody, but you can still see
+	env.ambient_light_color = Color(0.42, 0.48, 0.55)   # faint cold fill
+	env.ambient_light_energy = 0.16                     # dark, like the reference
 	env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
+	env.tonemap_exposure = 1.05
+
+	# Bloom on the fixtures and a touch of grade — this is most of what makes
+	# the reference frames read as "filmed" rather than flat.
+	env.glow_enabled = true
+	env.glow_intensity = 0.5
+	env.glow_bloom = 0.12
+	env.glow_hdr_threshold = 0.95
+	env.adjustment_enabled = true
+	env.adjustment_brightness = 1.0
+	env.adjustment_contrast = 1.12
+	env.adjustment_saturation = 0.92
+
+	# Slight haze so light pools have shape down the corridors.
+	env.volumetric_fog_enabled = true
+	env.volumetric_fog_density = 0.012
+	env.volumetric_fog_albedo = Color(0.85, 0.88, 0.92)
+	env.volumetric_fog_emission = Color(0, 0, 0)
+
 	world.environment = env
 	add_child(world)
 
